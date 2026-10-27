@@ -99,12 +99,14 @@ def summary_model(
                         "submissions": [],
                         "hints": 0,
                         "hints_before_first": 0,
+                        "hint_before": False,
                     },
                 )
                 row["submissions"].append(
                     {
                         "reference": record["reference"],
                         "outcome": "correct" if correct else "incorrect",
+                        "hint_after": not correct,
                     }
                 )
                 row["hints"] += not correct
@@ -159,7 +161,7 @@ async def test_statistics_require_correct_rows_and_totals_after_real_reload(
 
 
 def test_fixture_contains_answers_not_the_expected_report() -> None:
-    from flaskr.service.learn.agent.engine.script import render_first_prompt
+    from markdownflow.engine.script import render_first_prompt
 
     session = exercise.exercise_session(CASES[0])
     assert session.messages[0].parts[0].content == render_first_prompt(
@@ -282,7 +284,7 @@ async def test_cli_dispatch_and_reports_keep_selected_family_and_settings() -> N
 async def test_stored_history_mutation_cannot_pass(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from flaskr.service.learn.agent.engine import Engine
+    from markdownflow.engine import Engine
 
     original = Engine.run_turn
 
@@ -425,7 +427,7 @@ async def test_compacted_statistics_read_originals_and_reuse_reloaded_cache(
 def test_long_correction_is_eligible_and_hidden_outside_excerpt_edges(
     case: dict,
 ) -> None:
-    from flaskr.service.learn.agent.engine.teaching_history import (
+    from markdownflow.engine.teaching_history import (
         project_teaching_history,
     )
     from pydantic_ai.messages import ModelMessagesTypeAdapter
@@ -472,7 +474,7 @@ async def test_correct_report_cannot_hide_missing_compaction_or_cache_reuse(
     defect: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from flaskr.service.learn.agent.engine import Engine
+    from markdownflow.engine import Engine
 
     if defect == "projection":
         original_init = Engine.__init__

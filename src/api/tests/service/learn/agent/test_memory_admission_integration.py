@@ -10,10 +10,10 @@ from flask import Flask
 from flaskr.dao import db
 from flaskr.dao.uow import unit_of_work
 from flaskr.service.learn.agent import run_agent, session_store
-from flaskr.service.learn.agent.engine import Engine
 from flaskr.service.learn.memory import load_memory
 from flaskr.service.profile.models import VariableValue
 from flaskr.service.user.repository import create_user_entity
+from markdownflow.engine import Engine
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
@@ -136,8 +136,10 @@ def test_failed_session_save_rolls_back_an_admitted_request(
         before = session_store.load_agent_session(app, user, lesson).dumps()
         original = session_store._apply
 
-        def fail(row: object, session: object) -> None:
-            original(row, session)
+        def fail(
+            row: object, session: object, *, content_revision: int | None = None
+        ) -> None:
+            original(row, session, content_revision=content_revision)
             assert (
                 VariableValue.query.filter_by(
                     user_bid=user, key="requested_pace"

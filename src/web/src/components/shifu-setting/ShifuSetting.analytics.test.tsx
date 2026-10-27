@@ -8,6 +8,7 @@ import {
 } from '@testing-library/react';
 import ShifuSettingDialog from './ShifuSetting';
 import { SSE } from 'sse.js';
+import { TITLE_MAX_LENGTH } from '@/constants/uiConstants';
 
 const mockTtsConfig = jest.fn();
 const mockListMinimaxTtsVoices = jest.fn();
@@ -231,6 +232,44 @@ describe('ShifuSettingDialog analytics producer', () => {
       use_learner_language: true,
     });
   });
+
+  it.each([
+    ['name', '', 'shifuNameEmpty', 'Valid course name'],
+    [
+      'name',
+      'a'.repeat(TITLE_MAX_LENGTH + 1),
+      'shifuNameMaxLength',
+      'Valid course name',
+    ],
+    ['description', 'a'.repeat(501), 'shifuDescriptionMaxLength', ''],
+    ['systemPrompt', 'a'.repeat(20001), 'shifuPromptMaxLength', ''],
+    ['price', '', 'shifuPriceEmpty', '1.23'],
+    ['price', 'not-a-price', 'shifuPriceFormat', '1.23'],
+    ['price', '1.234', 'shifuPriceFormat', '1.23'],
+  ])(
+    'shows the %s validation error and saves after correction',
+    async (fieldName, invalidValue, message, correctedValue) => {
+      const { onSave } = renderOpenSettings();
+      const name = await screen.findByDisplayValue('Private course name');
+      const form = name.closest('form')!;
+      const field = form.querySelector(`[name="${fieldName}"]`)!;
+
+      // Bypass native input limits to exercise the resolver's own boundaries.
+      fireEvent.change(field, { target: { value: invalidValue } });
+      fireEvent.submit(form);
+      expect(
+        await screen.findByText(`module.shifuSetting.${message}`),
+      ).toBeInTheDocument();
+      expect(field).toHaveAttribute('aria-invalid', 'true');
+      expect(mockSaveShifuDetail).not.toHaveBeenCalled();
+      expect(onSave).not.toHaveBeenCalled();
+
+      fireEvent.change(field, { target: { value: correctedValue } });
+      fireEvent.submit(form);
+      await waitFor(() => expect(mockSaveShifuDetail).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    },
+  );
 
   it.each(['close', 'submit'])(
     'hides temperature controls and omits them when saving through %s',
@@ -917,6 +956,73 @@ describe('ShifuSettingDialog analytics producer', () => {
         >;
       };
   };
+
+  it.each([false, true])(
+    'retains API-configured workflow context on an unrelated title save when tracking throws=%s',
+    async trackingThrows => {
+      const latestProps = configureModelProvider('1', 'coze_workflow');
+      const persisted = {
+        api_key: 'saved-secret',
+        workflow_id: 'workflow-1',
+        context_key: 'classroom_context',
+        query_key: 'input',
+        parameters: { tenant: 'private-tenant' },
+        extra_body: { bot_id: 'private-bot' },
+      };
+      mockAskConfig.mockResolvedValue({
+        providers: [
+          {
+            provider: 'coze_workflow',
+            default_config: { api_key: '', workflow_id: '' },
+            json_schema: {
+              additionalProperties: true,
+              properties: {
+                api_key: { type: 'string' },
+                workflow_id: { type: 'string' },
+              },
+              required: ['api_key', 'workflow_id'],
+            },
+          },
+        ],
+      });
+      const detail = await mockGetShifuDetail();
+      mockGetShifuDetail.mockResolvedValue({
+        ...detail,
+        ask_provider_config: {
+          provider: 'coze_workflow',
+          mode: 'provider_only',
+          config: persisted,
+        },
+      });
+      if (trackingThrows)
+        mockTrackEvent.mockImplementation(() => {
+          throw new Error('analytics unavailable');
+        });
+      const { onSave } = renderOpenSettings();
+      const name = await screen.findByDisplayValue(
+        'Private numbered model course',
+      );
+      await waitFor(() =>
+        expect(latestProps().resolvedAskProvider).toBe('coze_workflow'),
+      );
+      fireEvent.change(name, { target: { value: 'Updated title' } });
+      fireEvent.submit(name.closest('form')!);
+      await waitFor(() => expect(mockSaveShifuDetail).toHaveBeenCalledTimes(1));
+      expect(mockSaveShifuDetail.mock.calls[0][0].ask_provider_config).toEqual({
+        provider: 'coze_workflow',
+        mode: 'provider_only',
+        config: persisted,
+      });
+      await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+      expect(mockTrackEvent).toHaveBeenCalledWith(
+        'creator_shifu_setting_save',
+        expect.objectContaining({ shifu_bid: 'course-1', save_type: 'manual' }),
+      );
+      expect(JSON.stringify(mockTrackEvent.mock.calls)).not.toMatch(
+        /context_key|classroom_context|query_key|private-tenant|private-bot|saved-secret|parameters|extra_body/,
+      );
+    },
+  );
 
   it.each(
     ['1', '3', '7'].flatMap(modelIndex =>

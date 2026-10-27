@@ -11,11 +11,11 @@ import pytest
 from flaskr.dao import db
 from flaskr.dao.uow import unit_of_work
 from flaskr.service.learn.agent import run_agent, session_store
-from flaskr.service.learn.agent.engine import Engine, Session
-from flaskr.service.learn.agent.engine.script import ScriptBundle, render_first_prompt
 from flaskr.service.learn.agent.nickname import refresh_nickname
 from flaskr.service.learn.learn_dtos import GeneratedType
 from flaskr.service.user.repository import create_user_entity, get_user_entity_by_bid
+from markdownflow.engine import Engine, Session
+from markdownflow.engine.script import ScriptBundle, render_first_prompt
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -148,7 +148,7 @@ def test_resumed_model_uses_current_name_and_preserves_history(
         else:
             assert "Ask %{{sys_user_nickname}}." in prompt
         assert "````text\n```\n{{sys_user_nickname}}\n````" in prompt
-        assert "{{unknown}}" in prompt
+        assert '<unavailable_learner_value name="unknown" />' in prompt
         assert seen[0][1] == before.messages[1]
         db.session.remove()
         saved = session_store.load_agent_session(app, ids[0], ids[2])
@@ -288,8 +288,10 @@ def test_failed_resume_does_not_persist_prompt_repair(
         before = session_store.load_agent_session(app, ids[0], ids[2]).dumps()
         original = session_store._apply
 
-        def fail(row: object, session: Session) -> None:
-            original(row, session)
+        def fail(
+            row: object, session: Session, *, content_revision: int | None = None
+        ) -> None:
+            original(row, session, content_revision=content_revision)
             message = "injected repair save failure"
             raise RuntimeError(message)
 

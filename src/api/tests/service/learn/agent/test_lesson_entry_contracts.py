@@ -3,14 +3,15 @@
 import uuid
 from collections.abc import Callable
 from decimal import Decimal
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
+from flaskr.api.llm import markdownflow_model as gateway_module
 from flaskr.api.llm import model_selection
 from flaskr.dao import db
 from flaskr.dao.uow import unit_of_work
 from flaskr.service.common.models import ERROR_CODE, AppError
-from flaskr.service.learn.agent import gateway_model as gateway_module
+from flaskr.service.learn.agent import langfuse_tracing as course_tracing
 from flaskr.service.learn.agent import lesson_entry as entry
 from flaskr.service.learn.agent.run_agent import TurnOutcome
 from flaskr.service.learn.exceptions import PaidError
@@ -27,9 +28,12 @@ from flaskr.service.shifu.consts import UNIT_TYPE_VALUE_NORMAL
 from flaskr.service.shifu.models import (
     DraftOutlineItem,
     DraftShifu,
+    LogDraftStruct,
+    LogPublishedStruct,
     PublishedOutlineItem,
     PublishedShifu,
 )
+from flaskr.service.shifu.shifu_history_manager import HistoryItem
 from pydantic_ai.models import ModelRequestParameters
 
 
@@ -100,9 +104,9 @@ def test_all_lesson_models_send_the_current_attempt_and_block_to_the_gateway(
             learning_mode=learning_mode,
         )
     assert [r["generation_name"] for r in requests[:3]] == [
-        "agent_lesson",
-        "agent_teaching_summary",
-        "agent_memory_admission",
+        "teaching",
+        "history_summary",
+        "memory_check",
     ]
 
 
@@ -138,6 +142,8 @@ def lesson(app: object, monkeypatch: object) -> object:
     yield identity
     with app.app_context(), unit_of_work():
         for model in (
+            LogDraftStruct,
+            LogPublishedStruct,
             Order,
             DraftOutlineItem,
             DraftShifu,
@@ -145,6 +151,39 @@ def lesson(app: object, monkeypatch: object) -> object:
             PublishedShifu,
         ):
             model.query.filter_by(shifu_bid=identity).delete()
+
+
+@pytest.mark.parametrize("preview", [False, True])
+@pytest.mark.parametrize("multilingual", [False, True])
+def test_resolver_reads_language_setting_from_the_selected_course_version(
+    app: object, lesson: str, preview: bool, multilingual: bool
+) -> None:
+    selected = DraftShifu if preview else PublishedShifu
+    other = PublishedShifu if preview else DraftShifu
+    with app.app_context(), unit_of_work():
+        selected.query.filter_by(shifu_bid=lesson).one().use_learner_language = int(
+            multilingual
+        )
+        other.query.filter_by(shifu_bid=lesson).one().use_learner_language = int(
+            not multilingual
+        )
+    with app.app_context():
+        resolved_context = Mock()
+        resolved = entry._resolve(
+            app,
+            user_bid="teacher",
+            shifu_bid=lesson,
+            outline_bid=lesson,
+            preview_mode=preview,
+            on_resolved=resolved_context,
+        )
+        assert resolved[-1] is multilingual
+        facts = resolved_context.call_args.kwargs
+        assert facts["shifu"].id == selected.query.filter_by(shifu_bid=lesson).one().id
+        assert facts["outline"].outline_item_bid == lesson
+        assert facts["outline_model"] is (
+            DraftOutlineItem if preview else PublishedOutlineItem
+        )
 
 
 @pytest.mark.parametrize("preview", [False, True])
@@ -163,7 +202,7 @@ def test_lesson_resolution_preserves_course_selection_and_revision_metadata(
         course.llm = saved
         record_id = course.id
     with app.app_context():
-        script, brief, settings = entry._resolve(
+        script, brief, settings, _revision, _language = entry._resolve(
             app,
             user_bid="learner",
             shifu_bid=lesson,
@@ -187,6 +226,62 @@ def test_lesson_resolution_preserves_course_selection_and_revision_metadata(
         if saved == "2"
         else ("missing_selection" if saved == "" else "invalid_selection"),
     }
+
+
+@pytest.mark.parametrize("preview", [False, True])
+@pytest.mark.parametrize(
+    "metadata", ["matching", "different-row", "missing-revision", "missing-struct"]
+)
+def test_lesson_revision_belongs_to_the_physical_row_supplying_the_script(
+    app: object, lesson: str, preview: bool, metadata: str
+) -> None:
+    outline_model, course_model = entry._models(preview)
+    struct_model = LogDraftStruct if preview else LogPublishedStruct
+    with app.app_context(), unit_of_work():
+        outline = outline_model.query.filter_by(shifu_bid=lesson).one()
+        course = course_model.query.filter_by(shifu_bid=lesson).one()
+        if metadata != "missing-struct":
+            db.session.add(
+                struct_model(
+                    struct_bid=uuid.uuid4().hex,
+                    shifu_bid=lesson,
+                    struct=HistoryItem(
+                        bid=lesson,
+                        id=course.id,
+                        type="shifu",
+                        children=[
+                            HistoryItem(
+                                bid=lesson,
+                                id=outline.id,
+                                type="outline",
+                                content_revision=None
+                                if metadata == "missing-revision"
+                                else 41,
+                            )
+                        ],
+                    ).to_json(),
+                )
+            )
+        if metadata == "different-row":
+            db.session.add(
+                outline_model(
+                    shifu_bid=lesson,
+                    outline_item_bid=lesson,
+                    content="New physical script",
+                    type=UNIT_TYPE_VALUE_NORMAL,
+                )
+            )
+    with app.app_context():
+        script, _brief, _settings, revision, _language = entry._resolve(
+            app,
+            user_bid="learner",
+            shifu_bid=lesson,
+            outline_bid=lesson,
+            preview_mode=preview,
+        )
+    if metadata == "different-row":
+        assert script == "New physical script"
+    assert revision == (41 if metadata == "matching" else None)
 
 
 @pytest.mark.parametrize("invalid", ["other-course", "blank-script", "deleted"])
@@ -277,14 +372,16 @@ def test_agent_turn_always_closes_its_trace_with_the_actual_outcome(
             "model_selection_original": "2",
         },
     )
-    monkeypatch.setattr(entry, "_resolve", lambda *_a, **_kw: ("script", "", settings))
-    trace, span = object(), object()
-    monkeypatch.setattr(entry, "get_langfuse_client", object)
     monkeypatch.setattr(
-        entry, "create_trace_with_root_span", lambda **_kw: (trace, span)
+        entry, "_resolve", lambda *_a, **_kw: ("script", "", settings, 41, False)
     )
-    finalize = Mock()
-    monkeypatch.setattr(entry, "finalize_langfuse_trace", finalize)
+    span = object()
+    tracing = MagicMock(model_parent=span)
+    tracing.capture.side_effect = lambda events: course_tracing.CourseTrace.capture(
+        tracing, events
+    )
+    monkeypatch.setattr(entry, "CourseTrace", Mock(return_value=tracing))
+    finalize = tracing.__exit__
     gateway = Mock(return_value=object())
     summary = Mock(return_value=object())
     monkeypatch.setattr(entry, "make_teaching_summarizer", summary)
@@ -328,16 +425,20 @@ def test_agent_turn_always_closes_its_trace_with_the_actual_outcome(
             next(stream)
     else:
         assert list(stream) == []
-    finalize.assert_called_once_with(
-        trace=trace,
-        root_span=span,
-        root_span_payload={"metadata": {"end_reason": termination}},
-    )
+    finalize.assert_called_once()
+    if termination == "completed":
+        assert finalize.call_args.args == (None, None, None)
+    else:
+        assert finalize.call_args.args[0] is (
+            RuntimeError if termination == "error" else GeneratorExit
+        )
+    tracing.append_output.assert_called_once_with("Visible answer")
     gateway.assert_any_call(
         app,
         "2",
         user_id="learner",
         span=span,
+        generation_name="teaching",
         usage_metadata=settings.usage_metadata,
         usage_scene=BILL_USAGE_SCENE_PREVIEW if preview_mode else BILL_USAGE_SCENE_PROD,
         usage_context=UsageContext(
@@ -357,7 +458,7 @@ def test_agent_turn_always_closes_its_trace_with_the_actual_outcome(
         "2",
         user_id="learner",
         span=span,
-        generation_name="agent_teaching_summary",
+        generation_name="history_summary",
         input_budget_bytes=40_960,
         retry_deadline_seconds=8,
         timeout=8,
@@ -379,7 +480,7 @@ def test_agent_turn_always_closes_its_trace_with_the_actual_outcome(
         "2",
         user_id="learner",
         span=span,
-        generation_name="agent_memory_admission",
+        generation_name="memory_check",
         usage_metadata=settings.usage_metadata,
         usage_scene=BILL_USAGE_SCENE_PREVIEW if preview_mode else BILL_USAGE_SCENE_PROD,
         usage_context=UsageContext(
@@ -399,9 +500,10 @@ def test_agent_turn_always_closes_its_trace_with_the_actual_outcome(
         memory_admission=True,
         memory_context_limit=32_768,
         memory_recall=True,
-        recall_history_compaction=True,
+        recall_history_compaction=False,
         teaching_history_compaction=True,
         exercise_statistics=True,
+        feedback_contract=True,
         teaching_summarizer=summary.return_value,
         memory_reserved_keys=entry.get_global_profile_keys(),
         memory_readonly_prefixes=("course:", "share:"),
@@ -424,21 +526,24 @@ def test_agent_turn_always_closes_its_trace_with_the_actual_outcome(
         "user_input": {"choice": ["a"]},
         "listen": listen,
         "preview_mode": preview_mode,
+        "content_revision": 41,
+        "use_learner_language": False,
         "shifu_model": DraftShifu if preview_mode else PublishedShifu,
         "heartbeat_interval": 0.1,
         "rewind": None,
+        "tracing": tracing,
     }
 
 
 def _entry_with_runner(monkeypatch: object) -> Mock:
     """Stub everything around the turn and return the mock standing in for the turn itself."""
     settings = LLMSettings(model="2", temperature=0.25, usage_metadata={})
-    monkeypatch.setattr(entry, "_resolve", lambda *_a, **_kw: ("script", "", settings))
-    monkeypatch.setattr(entry, "get_langfuse_client", object)
     monkeypatch.setattr(
-        entry, "create_trace_with_root_span", lambda **_kw: (object(), object())
+        entry, "_resolve", lambda *_a, **_kw: ("script", "", settings, 41, False)
     )
-    monkeypatch.setattr(entry, "finalize_langfuse_trace", Mock())
+    tracing = MagicMock()
+    tracing.capture.side_effect = lambda events: events
+    monkeypatch.setattr(entry, "CourseTrace", Mock(return_value=tracing))
     monkeypatch.setattr(entry, "GatewayModel", Mock(return_value=object()))
     monkeypatch.setattr(entry, "make_request_check", Mock(return_value=object()))
     monkeypatch.setattr(entry, "make_teaching_summarizer", Mock(return_value=object()))
@@ -446,6 +551,36 @@ def _entry_with_runner(monkeypatch: object) -> Mock:
     runner = Mock(side_effect=lambda *_a, **_kw: iter(()))
     monkeypatch.setattr(entry, "run_agent_lesson", runner)
     return runner
+
+
+@pytest.mark.parametrize("preview", [False, True])
+@pytest.mark.parametrize("listen", [False, True])
+def test_entry_passes_multilingual_setting_to_every_lesson_mode(
+    app: object, monkeypatch: object, preview: bool, listen: bool
+) -> None:
+    runner = _entry_with_runner(monkeypatch)
+    monkeypatch.setattr(
+        entry,
+        "_resolve",
+        lambda *_a, **_k: (
+            "script",
+            "",
+            LLMSettings(model="1", temperature=0.0),
+            None,
+            True,
+        ),
+    )
+    list(
+        entry.agent_lesson_events(
+            app,
+            user_bid="learner",
+            shifu_bid="course",
+            outline_bid="lesson",
+            preview_mode=preview,
+            listen=listen,
+        )
+    )
+    assert runner.call_args.kwargs["use_learner_language"] is True
 
 
 def _reload(app: object, **kwargs: object) -> list:
@@ -481,6 +616,28 @@ def test_failed_engine_turn_surfaces_an_error_instead_of_ending_silently(
                 outline_bid="lesson",
             )
         )
+
+
+def test_failed_turn_a_reset_discarded_is_marked_for_the_stream(
+    app: object, monkeypatch: object
+) -> None:
+    runner = _entry_with_runner(monkeypatch)
+
+    def failed_turn(*_args: object, **_kwargs: object) -> object:
+        yield from ()
+        return TurnOutcome(reason=None, taught=False, discarded=True)
+
+    runner.side_effect = failed_turn
+    with pytest.raises(entry.DiscardedTurnError) as exc:
+        list(
+            entry.agent_lesson_events(
+                app,
+                user_bid="learner",
+                shifu_bid="course",
+                outline_bid="lesson",
+            )
+        )
+    assert exc.value.code == ERROR_CODE["server.common.unknownError"]
 
 
 def test_input_budget_failure_uses_localized_error_after_the_saved_turn(

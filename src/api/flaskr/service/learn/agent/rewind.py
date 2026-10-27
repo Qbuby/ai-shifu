@@ -41,7 +41,7 @@ from flaskr.service.shifu.consts import (
 )
 
 if TYPE_CHECKING:
-    from flaskr.service.learn.agent.engine.session import Session
+    from flaskr.api.markdownflow import Session
 
 _KEY = "agent_turn"
 _VERSION = 1
@@ -70,6 +70,7 @@ def checkpoint_of(session: Session) -> dict[str, Any]:
         "messages": len(session.messages),
         "memory": state["memory"],
         "answer_hashes": state.get("answer_hashes", {}),
+        "memory_generations": state.get("memory_generations", {}),
         "pending": state["pending"],
         "answers": state["answers"],
         "request_inputs": state.get("request_inputs", []),
@@ -85,7 +86,7 @@ def restore(session: Session, checkpoint: dict[str, Any]) -> None:
     The script, the learner's profile and the usage count stay as they are: the first two are
     re-read every turn, and the model calls already made were made.
     """
-    from flaskr.service.learn.agent.engine.session import Session as SessionClass
+    from flaskr.api.markdownflow import Session as SessionClass
 
     state = session.to_dict()
     state.update(
@@ -108,6 +109,12 @@ def restore(session: Session, checkpoint: dict[str, Any]) -> None:
     session.messages = restored.messages
     session.memory = restored.memory
     session.answer_hashes = restored.answer_hashes
+    # Restored memory reflects the deletions seen when the checkpoint was taken, so later
+    # deletions are refreshed again. Older checkpoints refresh every deleted-once key.
+    session.memory_generations = {
+        str(key): int(value)
+        for key, value in (checkpoint.get("memory_generations") or {}).items()
+    }
     session.pending = restored.pending
     session.answers = restored.answers
     session.request_inputs = restored.request_inputs
@@ -124,7 +131,8 @@ def turn_record(checkpoint: dict[str, Any], values: list[str]) -> str:
     )
 
 
-def _read_turn_record(block: LearnGeneratedBlock) -> dict[str, Any] | None:
+def read_turn_record(block: LearnGeneratedBlock) -> dict[str, Any] | None:
+    """Read a recognized durable turn checkpoint without exposing session state to clients."""
     try:
         data = json.loads(block.block_content_conf or "")
     except ValueError:
@@ -143,7 +151,7 @@ def read_turn_learner_values(block: LearnGeneratedBlock) -> list[str]:
     Follow-up history uses this durable input evidence without reading agent
     sessions or exposing checkpoint memory, pending tools or configuration.
     """
-    record = _read_turn_record(block)
+    record = read_turn_record(block)
     if record is None:
         return []
     values = record.get("values")
@@ -236,7 +244,7 @@ def plan_rewind(
         target = later[0]
     else:
         target = block
-    record = _read_turn_record(target)
+    record = read_turn_record(target)
     if record is None:
         raise RewindUnavailableError
     if answering and not record["checkpoint"].get("pending"):

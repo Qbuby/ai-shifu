@@ -6,12 +6,13 @@ import asyncio
 import json
 import uuid
 from typing import TYPE_CHECKING
-from unittest.mock import Mock
 
 import pytest
+from flaskr.api import langfuse_markdownflow
+from flaskr.api.langfuse import MockClient
 from flaskr.dao import db
 from flaskr.dao.uow import unit_of_work
-from flaskr.service.learn.agent import bridge, lesson_entry
+from flaskr.service.learn.agent import lesson_entry
 from flaskr.service.learn.follow_up_context import load_follow_up_history
 from flaskr.service.learn.learn_dtos import GeneratedType
 from flaskr.service.learn.learn_funcs import reset_learn_record
@@ -19,6 +20,7 @@ from flaskr.service.learn.llmsetting import LLMSettings
 from flaskr.service.learn.models import LearnGeneratedBlock, LearnGeneratedElement
 from flaskr.service.shifu.consts import BLOCK_TYPE_MDCONTENT_VALUE
 from flaskr.service.user.repository import create_user_entity
+from markdownflow import bridge
 from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 
 if TYPE_CHECKING:
@@ -69,13 +71,11 @@ def agent_classroom(app: Flask, monkeypatch: pytest.MonkeyPatch) -> Callable:
             "Teach arithmetic and ask several questions. Do not finish before all questions.",
             "",
             LLMSettings(model="test-model", temperature=0.0),
+            11,
+            False,
         ),
     )
-    monkeypatch.setattr(lesson_entry, "get_langfuse_client", lambda: None)
-    monkeypatch.setattr(
-        lesson_entry, "create_trace_with_root_span", lambda **_k: (Mock(), Mock())
-    )
-    monkeypatch.setattr(lesson_entry, "finalize_langfuse_trace", lambda **_k: None)
+    monkeypatch.setattr(langfuse_markdownflow, "get_langfuse_client", MockClient)
 
     def drive(make_events: Callable, **_kwargs: object) -> Iterator:
         async def collect() -> list:

@@ -13,6 +13,7 @@
     "continueButton": "继续",
     "debugSessionExpired": "调试会话已过期或剧本已更改，请重新开始调试。",
     "defaultLearnerName": "同学",
+    "freeTextPlaceholder": "请输入你的回答",
     "generatedBlockNotFound": "生成的块未找到",
     "invalidAction": "无效的操作",
     "lessonFeedbackCommentPlaceholder": "选填：告诉我们你的建议",
@@ -20,6 +21,7 @@
     "llmStreamInterrupted": "生成过程中连接中断，请刷新后重试",
     "nextChapterButton": "下一节",
     "outputInProgress": "正在有内容输出中，请等待输出结束后再重试",
+    "resetLimitReached": "本节重修次数已用完，无法再次重新生成。你仍可继续学习、回看已有内容或提问。",
     "ttsRateLimited": "语音服务当前繁忙，请稍后重试"
   }
 }

@@ -7,15 +7,15 @@ import json
 from typing import TYPE_CHECKING
 
 import pytest
-from flaskr.service.learn.agent import gateway_model as gw
-from flaskr.service.learn.agent.engine import Engine, MessageTurn, Session, TurnDone
-from flaskr.service.learn.agent.engine.script import ScriptBundle
-from flaskr.service.learn.agent.engine.teaching_history import project_teaching_history
+from flaskr.api.llm import markdownflow_model as gw
 from flaskr.service.learn.agent.teaching_summary import make_teaching_summarizer
+from markdownflow.engine import Engine, MessageTurn, Session, TurnDone
+from markdownflow.engine.script import ScriptBundle
+from markdownflow.engine.teaching_history import project_teaching_history
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.models import ModelRequestParameters
 
-from tests.service.learn.agent.engine.test_teaching_summary import history
+from tests.markdownflow.engine.test_teaching_summary import history
 from tests.service.learn.agent.test_gateway_model import FakeChunk, FakeSpan
 
 if TYPE_CHECKING:
@@ -38,7 +38,7 @@ async def test_real_gateway_summary_isolated_billed_named_and_exact_read_still_w
 
     def fake(**kwargs: object) -> Iterator[FakeChunk]:
         calls.append(kwargs)
-        if kwargs["generation_name"] == "agent_teaching_summary":
+        if kwargs["generation_name"] == "history_summary":
             assert kwargs["user_id"] == "learner"
             assert kwargs["timeout"] == 8
             assert kwargs["num_retries"] == 0
@@ -78,7 +78,7 @@ async def test_real_gateway_summary_isolated_billed_named_and_exact_read_still_w
         "selected-course-model",
         user_id="learner",
         span=FakeSpan(),
-        generation_name="agent_teaching_summary",
+        generation_name="history_summary",
         input_budget_bytes=40_960,
         retry_deadline_seconds=8,
         timeout=8,

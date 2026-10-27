@@ -2,7 +2,7 @@
 title: Langfuse Trace Association
 status: implemented
 owner_surface: backend
-last_reviewed: 2026-08-17
+last_reviewed: 2026-10-26
 canonical: true
 ---
 
@@ -59,3 +59,142 @@ canonical: true
   - preview trace top-level `session_id` and root span finalization
   - ask nesting under a parent observation
   - publish summary trace output propagation
+
+## MarkdownFlow 2.0 Request Contract
+
+Course teaching and Profile onboarding share `flaskr.api.langfuse_markdownflow`.
+Their service-local `langfuse_tracing.py` modules own scene names, metadata,
+request actions, output filtering, and outcome mapping. Business code passes
+resolved objects and execution facts through small lifecycle hooks. Each
+accepted execution request owns one root observation; automatic native turns
+and model requests remain children of that root. Related requests use the
+native course session id or the existing Profile session id. Exact Profile
+request replay does not execute or charge a model again and does not start an
+additional execution trace.
+
+### Names and correlation
+
+Course names have the form `scene/course/chapter/lesson`. Scene names are
+`learn`, `preview`, and `debug`. Titles come from the same draft or published
+records used to resolve the lesson, with business ids as missing-title
+fallbacks. Profile uses `profile` and `profile-preview`, since its questionnaire
+does not belong to a course or lesson. Request ids, native turn indexes,
+progress/block identifiers, content/configuration revisions, learning mode,
+and operation type belong in metadata rather than observation names.
+
+Ancestor title lookup is bounded to twelve parent records per request. A deeper
+path keeps the nearest ancestors and exact lesson title, prefixes its displayed
+chapter path with `...`, and sets `chapter_path_truncated` in metadata. This
+makes the diagnostic limit visible without adding unbounded telemetry queries.
+
+The tree uses stable operation names:
+
+| Operation | Observation name |
+| --- | --- |
+| Effective prompt snapshot | `prompts` |
+| Course execution round | `teaching_round` |
+| Primary course model | `teaching` |
+| Delivered teaching history summary | `history_summary` |
+| Learner memory request check | `memory_check` |
+| Profile questionnaire model | `questionnaire` |
+| Delegated answer extraction | `answer_extraction` |
+
+A round is an `agent` observation, an LLM request is a `generation`, and an
+engine tool execution is a `tool`. Profile retains its generic `turn` round and
+the existing private `profile.summary` and `profile.model` hierarchy. Tool nodes
+keep the exact native tool names so they can be matched to actual model calls.
+The shared gateway remains the sole producer of model usage and cost
+observations. An observation proxy resolves
+the current turn when a gateway generation starts, so reused models follow new
+turns automatically. Explicit parent handles
+keep producer-thread calls in the correct tree without relying on ambient
+OpenTelemetry context or gateway mutation in business orchestration.
+
+### Inputs and public outputs
+
+Root input is the current submitted learner text or structured answers. A
+request without text uses an explicit start, continue, or regenerate action.
+It is not the last model-message array entry, which may be a tool response.
+The course `prompts` child records the actual native session script as
+`teaching_prompt` (Teaching Prompt) and the effective author teaching brief as
+`course_prompt` (Course Prompt). Restored sessions retain their script snapshot; debug
+sessions use the submitted editor document. Prompt bodies are observation
+input, not propagated trace metadata.
+
+Root output contains the public prose and interaction controls in presentation
+order. Hosts exclude heartbeats, audio, progress events, and private profile
+transformations. Cumulative Profile content snapshots contribute only their
+new suffix. Model generations retain their complete actual request messages,
+results, usage, and error details. Private Profile summary and answer-extraction
+operations are child spans in the same request, with their own real inputs and
+outputs; they do not replace the public root output.
+
+### Native model output channels
+
+When `chat_llm` emits native tool-call deltas, its generation output keeps the
+original content, reasoning, and tool calls separate. A response containing
+tools is an OpenAI-style assistant message list: `content` contains only the
+provider's text, optional `reasoning_content` contains its reasoning, and
+`tool_calls` contains each call's id, type, function name, and original argument
+string. Streamed calls are assembled by index, in index order, including
+fragmented names and arguments and ids received after the initial fragment.
+An interrupted call retains its incomplete argument string for diagnosis.
+Arguments are never parsed or rewritten for tracing.
+
+Text that resembles `<interact ...>` or another tool remains text in its
+original channel. Observability does not infer a tool call from markup or
+remove invalid content; the engine's independent validation may suppress or
+retry that raw model response before public delivery. Generation output thus
+describes what the gateway received, while root output describes what the host
+presented.
+
+Responses without native tools retain the previous output format: a string for
+plain content, or an object with `content` and `reasoning_content` when reasoning
+is present. Existing traces are not rewritten. Runtime deltas, usage accounting,
+the billing `output_text` summary, and raw OpenAI gateway endpoints retain their
+existing contracts. Consumers of new tool-bearing `chat_llm` generations must
+read `content` and `tool_calls` from the assistant message instead of treating
+the output as a concatenated string.
+
+The assistant-message representation follows the
+[Langfuse input/output formatting guidance](https://langfuse.com/docs/observability/best-practices).
+
+### Completion and failure isolation
+
+Native tool calls are paired by their tool-call ids where possible. Deferred
+interaction requests close the corresponding tool with the pending question.
+Memory updates identify staged notes; unmatched `remember` calls are closed
+with an unavailable-result status rather than an invented successful result.
+Tools such as `finish` that omit a result stay open at the native turn boundary
+and close only when the host reports its authoritative saved outcome. A failed
+or discarded save must not leave an unresolved tool labeled as successful.
+Any outstanding tool/turn is also closed when the request fails or disconnects.
+
+The host marks a business outcome only after its authoritative save succeeds,
+before publishing progress updates or terminal DTOs from that save. Course turn
+observations stay open until all delivered output has been collected; closing
+the transport during post-save progression still retains the committed outcome.
+Root metadata separates `runtime_outcome`
+from `transport_closed`, retaining `end_reason` for existing diagnostics. A
+connection closed after a committed waiting/completed result remains successful;
+a real mid-turn disconnect retains partial public output. A discarded save is
+distinct from completion. Profile retains its buffered atomic publication and
+retry semantics, including failures during private summary generation.
+
+SDK create, update, child creation, and end operations are best-effort through
+safe observation handles. Their failure cannot interrupt teaching, settlement,
+session writes, or SSE publication. This contract uses Langfuse 4.14.4, changes
+no database or persisted native-session schema, and applies only to new traces.
+Independent ask, live voice, and capability probes retain their existing
+semantics.
+
+### Acceptance checks
+
+Focused host regressions cover all five scenes, structured answers, no-text
+actions, restored context, automatic continuation, tool completion, visible
+interactions, failed/discarded saves, terminal-close classification, replay, and
+SDK failure isolation. Real-SDK in-memory tests assert observation types,
+parent-child ids, propagated session/user attributes, root IO, and idempotent
+finalization. Remote acceptance additionally requires executing the deployed
+test paths and reading back their observations in Langfuse; an in-memory export
+or a successful submission alone is not remote acceptance.

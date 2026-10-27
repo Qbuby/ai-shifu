@@ -20,6 +20,7 @@ from flaskr.common.shifu_context import (
     get_shifu_context_snapshot,
 )
 from flaskr.dao import (
+    cleanup_session_after,
     db,
     invalidate_session,
     is_abnormal_stream_termination,
@@ -27,7 +28,7 @@ from flaskr.dao import (
 )
 from flaskr.dao.uow import unit_of_work
 from flaskr.i18n import _, get_current_language, set_language
-from flaskr.service.common.models import ERROR_CODE, AppError, raise_error
+from flaskr.service.common.models import AppError, raise_error
 from flaskr.service.learn.agent.routing import uses_agent_engine
 from flaskr.service.learn.const import INPUT_TYPE_ASK
 from flaskr.service.learn.context_v2 import RunScriptContextV2
@@ -40,6 +41,7 @@ from flaskr.service.learn.learn_dtos import (
     RunStatusDTO,
 )
 from flaskr.service.learn.listen_elements import ListenElementRunAdapter
+from flaskr.service.learn.request_stream import RequestCompletion
 from flaskr.service.order.consts import ORDER_STATUS_SUCCESS
 from flaskr.service.order.models import Order
 from flaskr.service.shifu.shifu_struct_manager import (
@@ -698,6 +700,55 @@ def _make_audio_backfill_ready_event(
     )
 
 
+def _follow_up_events(
+    *,
+    app: Flask,
+    user_bid: str,
+    outline_bid: str,
+    user_input: str | dict | None,
+    reload_generated_block_bid: str | None,
+    reload_element_bid: str | None,
+    listen: bool,
+    learning_mode: str,
+    preview_mode: bool,
+    stop_event: threading.Event,
+    element_adapter: ListenElementRunAdapter,
+) -> Generator[RunMarkdownFlowDTO | RunElementSSEMessageDTO, None, None]:
+    """Answer a follow-up question, owning its database session like a lesson step."""
+    from flaskr.service.learn.ask import FollowUpCancelledError, follow_up_events
+
+    try:
+        _ensure_healthy_db_connection(app)
+        yield from element_adapter.process(
+            follow_up_events(
+                app,
+                user_bid=user_bid,
+                outline_bid=outline_bid,
+                user_input=user_input,
+                reload_generated_block_bid=reload_generated_block_bid,
+                reload_element_bid=reload_element_bid,
+                listen=listen,
+                learning_mode=learning_mode,
+                preview_mode=preview_mode,
+                stop_event=stop_event,
+            )
+        )
+        _commit_pending_step()
+    except BreakError:
+        _commit_pending_step()
+        app.logger.info("BreakError")
+    except (FollowUpCancelledError, GeneratorExit):
+        # The close lands at an arbitrary point (client disconnect), so the
+        # connection's protocol state is unknowable: discard it, never roll back.
+        _discard_session_connection(source="follow-up cancelled")
+        app.logger.info("follow-up stream closed")
+    except Exception as exc:
+        cleanup_session_after(exc, source="follow-up stream error")
+        raise
+    finally:
+        _remove_db_session_safely(app, source="follow-up")
+
+
 def _lesson_events(
     *,
     app: Flask,
@@ -722,15 +773,33 @@ def _lesson_events(
 
     Everything downstream is shared -- the lock this runs inside, the element adapter, TTS, the SSE
     framing -- so serialisation and persistence hold for both engines without being reimplemented.
+
+    A follow-up question is answered by `learn.ask` whichever engine teaches the lesson.
     """
+    if input_type == INPUT_TYPE_ASK:
+        yield from _follow_up_events(
+            app=app,
+            user_bid=user_bid,
+            outline_bid=outline_bid,
+            user_input=user_input,
+            reload_generated_block_bid=reload_generated_block_bid,
+            reload_element_bid=reload_element_bid,
+            listen=listen,
+            learning_mode=learning_mode,
+            preview_mode=preview_mode,
+            stop_event=stop_event,
+            element_adapter=element_adapter,
+        )
+        return
     if _teaches_with_agent(
         shifu_bid=shifu_bid,
         input_type=input_type,
         reload_generated_block_bid=reload_generated_block_bid,
         reload_element_bid=reload_element_bid,
     ):
-        from flaskr.service.learn.agent.bridge import TurnCapacityError
+        from flaskr.api.markdownflow import TurnCapacityError
         from flaskr.service.learn.agent.lesson_entry import (
+            DiscardedTurnError,
             LessonNotTeachable,
             agent_lesson_events,
             require_teachable_preview,
@@ -856,12 +925,15 @@ def _lesson_events(
                     else:
                         yield payload
             except AppError as exc:
-                if (
-                    exc.code == ERROR_CODE["server.learn.agentInputBudgetExceeded"]
-                    and element_adapter is not None
+                if element_adapter is not None and not isinstance(
+                    exc, DiscardedTurnError
                 ):
-                    # A later tool request can be refused after text was shown. Persist its
+                    # A turn can fail after text was shown: a refused tool request, a provider
+                    # error after output started, or an exhausted recovery. The engine keeps
+                    # that text in its saved session and continues after it, so persist the
                     # buffered elements before surfacing the error, without sending DONE.
+                    # Errors raised before any output leave nothing pending, and a turn a
+                    # concurrent reset discarded must leave nothing behind.
                     yield from element_adapter.finalize_pending_blocks()
                     _commit_pending_step()
                 raise
@@ -1017,6 +1089,7 @@ def run_script(
         persist_only_final=teaches_with_agent,
     )
     stream_element_adapter = element_adapter
+    completion = RequestCompletion()
     if is_ask:
         # Ask (follow-up) requests use a counting semaphore instead of the main mutex
         # so they can run in parallel with the main lesson stream (up to
@@ -1170,8 +1243,6 @@ def run_script(
             stream_error: Exception | None = None
             client_disconnected = False
             done_received = False
-            last_stream_type: str | None = None
-            last_stream_done_is_terminal: bool | None = None
 
             def _should_suppress_live_payload(payload_obj: object) -> bool:
                 payload_type = getattr(payload_obj, "type", None)
@@ -1213,6 +1284,7 @@ def run_script(
                             )
                             yield _to_sse_chunk(heartbeat_payload)
                         except GeneratorExit:
+                            completion.cancel()
                             client_disconnected = True
                             stop_event.set()
                             app.logger.info(
@@ -1220,6 +1292,7 @@ def run_script(
                             )
                             return
                         except (ConnectionError, BrokenPipeError, OSError) as exc:
+                            completion.cancel()
                             client_disconnected = True
                             stop_event.set()
                             app.logger.info(
@@ -1234,23 +1307,17 @@ def run_script(
                         _refresh_run_script_status()
                         if _should_suppress_live_payload(payload):
                             continue
-                        payload_type = getattr(payload, "type", None)
-                        if hasattr(payload_type, "value"):
-                            payload_type = payload_type.value
-                        yield (
+                        chunk = (
                             "data: "
                             + json.dumps(payload, default=fmt, ensure_ascii=False)
                             + b"\n\n".decode("utf-8")
                         )
-                        if isinstance(payload_type, str):
-                            last_stream_type = payload_type
-                            if payload_type == GeneratedType.DONE.value:
-                                last_stream_done_is_terminal = bool(
-                                    getattr(payload, "is_terminal", False)
-                                )
-                            else:
-                                last_stream_done_is_terminal = None
+                        completion.record_serialized(payload)
+                        yield chunk
+                        if completion.terminal_sent:
+                            break
                     except GeneratorExit:
+                        completion.cancel()
                         client_disconnected = True
                         stop_event.set()
                         app.logger.info(
@@ -1258,6 +1325,7 @@ def run_script(
                         )
                         return
                     except (ConnectionError, BrokenPipeError, OSError) as exc:
+                        completion.cancel()
                         client_disconnected = True
                         stop_event.set()
                         app.logger.info(
@@ -1294,7 +1362,6 @@ def run_script(
                         element_adapter=stream_element_adapter,
                     )
                 )
-                last_stream_type = "error"
                 block_end_event = _make_terminal_event(
                     outline_bid=outline_bid,
                     event_type=GeneratedType.BREAK.value,
@@ -1304,31 +1371,18 @@ def run_script(
                 )
                 if not _should_suppress_live_payload(block_end_event):
                     yield _to_sse_chunk(block_end_event)
-                    last_stream_type = (
-                        GeneratedType.DONE.value
-                        if use_element_protocol
-                        else GeneratedType.BREAK.value
-                    )
-                    last_stream_done_is_terminal = (
-                        False if use_element_protocol else None
-                    )
 
-            if not client_disconnected and not (
-                use_element_protocol
-                and last_stream_type == GeneratedType.DONE.value
-                and last_stream_done_is_terminal is True
-            ):
-                yield _to_sse_chunk(
-                    _make_terminal_event(
-                        outline_bid=outline_bid,
-                        event_type=GeneratedType.DONE.value,
-                        content="",
-                        element_adapter=stream_element_adapter,
-                        is_terminal=True if use_element_protocol else None,
-                    )
+            if completion.needs_terminal:
+                terminal = _make_terminal_event(
+                    outline_bid=outline_bid,
+                    event_type=GeneratedType.DONE.value,
+                    content="",
+                    element_adapter=stream_element_adapter,
+                    is_terminal=True if use_element_protocol else None,
                 )
-                last_stream_type = GeneratedType.DONE.value
-                last_stream_done_is_terminal = True if use_element_protocol else None
+                chunk = _to_sse_chunk(terminal)
+                completion.record_serialized(terminal)
+                yield chunk
         finally:
             stop_event.set()
             if producer_thread is not None:

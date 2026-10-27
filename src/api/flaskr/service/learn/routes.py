@@ -1,5 +1,6 @@
 """Expose HTTP routes for learning sessions."""
 
+import contextlib
 import json
 import re
 import sys
@@ -40,11 +41,14 @@ from flaskr.service.learn.lesson_feedback import (
     list_lesson_feedbacks,
     submit_lesson_feedback,
 )
+from flaskr.service.learn.lesson_reset_limit import get_lesson_reset_status
 from flaskr.service.learn.listen_elements import get_listen_element_record
+from flaskr.service.learn.preview_language import resolve_preview_language
 from flaskr.service.learn.preview_permissions import (
     require_shifu_preview_permission,
     resolve_preview_request_user,
 )
+from flaskr.service.learn.request_stream import RequestCompletion
 from flaskr.service.learn.runscript_v2 import get_run_status, run_script
 from flaskr.service.metering.consts import (
     BILL_USAGE_SCENE_PREVIEW,
@@ -112,34 +116,65 @@ def _stream_sse_response(
     terminal_event_factory: object = None,
 ) -> Response:
     def event_stream() -> Iterator[str]:
+        completion = RequestCompletion()
+        source = None
+
+        def emit_message(message: object) -> Iterator[str]:
+            chunk = _to_sse_data_line(message)
+            completion.record_serialized(message)
+            try:
+                yield chunk
+            except BaseException:
+                completion.cancel()
+                raise
+
         try:
-            for message in message_iter_factory():
-                yield _to_sse_data_line(message)
+            try:
+                source = message_iter_factory()
+                for message in source:
+                    yield from emit_message(message)
+                    if completion.terminal_sent:
+                        break
+            except AppError as exc:
+                if completion.cancelled:
+                    raise
+                app.logger.warning("%s: %s (code: %s)", error_log, exc, exc.code)
+                if error_event_factory is None:
+                    raise
+                yield from emit_message(error_event_factory(exc))
+            except Exception as exc:
+                if completion.cancelled:
+                    raise
+                app.logger.exception(error_log)
+                if is_protocol_interrupt_error(exc):
+                    invalidate_session(source="learn stream_sse_response desync")
+                if error_event_factory is None:
+                    raise
+                yield from emit_message(error_event_factory(exc))
+            if completion.needs_terminal and terminal_event_factory is not None:
+                yield from emit_message(terminal_event_factory())
         except GeneratorExit:
+            completion.cancel()
             app.logger.info(close_log)
             # The close may have interrupted a DB exchange mid-stream:
             # discard the connection so the finally's remove does not send a
             # ROLLBACK on a possibly desynced stream.
             invalidate_session(source="learn stream_sse_response close")
             raise
-        except AppError as exc:
-            app.logger.warning("%s: %s (code: %s)", error_log, exc, exc.code)
-            if error_event_factory is None:
+        except (ConnectionError, OSError):
+            if not completion.cancelled:
                 raise
-            yield _to_sse_data_line(error_event_factory(exc))
-            if terminal_event_factory is not None:
-                yield _to_sse_data_line(terminal_event_factory())
-        except Exception as exc:
-            app.logger.exception(error_log)
-            if is_protocol_interrupt_error(exc):
-                invalidate_session(source="learn stream_sse_response desync")
-            if error_event_factory is None:
-                raise
-            yield _to_sse_data_line(error_event_factory(exc))
-            if terminal_event_factory is not None:
-                yield _to_sse_data_line(terminal_event_factory())
+            completion.cancel()
+            app.logger.info(close_log)
+            invalidate_session(source="learn stream_sse_response close")
         finally:
-            _release_db_session(app, source="learn stream_sse_response")
+            try:
+                close = getattr(source, "close", None)
+                if close is not None:
+                    with contextlib.suppress(Exception):
+                        close()
+            finally:
+                _release_db_session(app, source="learn stream_sse_response")
 
     _release_db_session(app, source="learn stream_sse_response")
     return Response(
@@ -594,6 +629,16 @@ def register_learn_routes(app: Flask, path_prefix: str = "/api/learn") -> Flask:
             and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", debug_run_bid)
         ):
             raise_param_error("Invalid debug session identifier")
+
+        # Capture the request fallback before streaming clears request-local i18n.
+        # Both runtimes receive the same authoritative editor language.
+        variables = dict(preview_request.variables or {})
+        preview_language = resolve_preview_language(variables)
+        preview_request.variables = {
+            **variables,
+            "sys_user_language": preview_language,
+            "language": preview_language,
+        }
         if uses_agent_engine(shifu_bid) and debug_run_bid:
             from flaskr.service.learn.agent.debug_session import stream_debug_preview
 
@@ -786,7 +831,66 @@ def register_learn_routes(app: Flask, path_prefix: str = "/api/learn") -> Flask:
             require_shifu_preview_permission(app, user_bid, shifu_bid)
         return make_common_response(
             reset_learn_record(
-                app, shifu_bid, outline_bid, user_bid, preview_mode=preview_mode
+                app,
+                shifu_bid,
+                outline_bid,
+                user_bid,
+                preview_mode=preview_mode,
+                reset_request_id=request.headers.get("X-Request-ID"),
+            )
+        )
+
+    @app.route(
+        path_prefix + "/shifu/<shifu_bid>/records/<outline_bid>/reset-status",
+        methods=["GET"],
+    )
+    @with_shifu_context()
+    def lesson_reset_status_api(shifu_bid: str, outline_bid: str) -> str:
+        """Return whether the learner may still reset the outline.
+
+        ---
+        tags:
+            - learn
+        parameters:
+            - name: shifu_bid
+              type: string
+              required: true
+            - name: outline_bid
+              type: string
+              required: true
+            - name: preview_mode
+              type: boolean
+              required: false
+        responses:
+            200:
+                description: reset availability of the outline
+                content:
+                    application/json:
+                        schema:
+                            properties:
+                                code:
+                                    type: integer
+                                    description: code
+                                message:
+                                    type: string
+                                    description: message
+                                data:
+                                    type: object
+                                    properties:
+                                        can_reset:
+                                            type: boolean
+        """
+        user_bid = request.user.user_id
+        preview_mode = request.args.get("preview_mode", "false").lower() == "true"
+        if preview_mode:
+            require_shifu_preview_permission(app, user_bid, shifu_bid)
+        return make_common_response(
+            get_lesson_reset_status(
+                app,
+                shifu_bid,
+                outline_bid,
+                user_bid,
+                preview_mode=preview_mode,
             )
         )
 

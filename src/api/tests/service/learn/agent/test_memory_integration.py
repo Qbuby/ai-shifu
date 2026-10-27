@@ -11,7 +11,6 @@ import pytest
 from flaskr.dao import db
 from flaskr.dao.uow import unit_of_work
 from flaskr.service.learn.agent import run_agent, session_store
-from flaskr.service.learn.agent.engine import Engine
 from flaskr.service.learn.learn_dtos import GeneratedType
 from flaskr.service.learn.memory import (
     MemoryUpdate,
@@ -21,6 +20,7 @@ from flaskr.service.learn.memory import (
 )
 from flaskr.service.profile.models import Variable, VariableValue
 from flaskr.service.user.repository import create_user_entity
+from markdownflow.engine import Engine
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -217,8 +217,10 @@ def test_failed_session_save_rolls_back_answer_and_note_together(
     before = session_store.load_agent_session(app, user, lesson).dumps()
     original_apply = session_store._apply
 
-    def fail_after_apply(row: object, session: object) -> None:
-        original_apply(row, session)
+    def fail_after_apply(
+        row: object, session: object, *, content_revision: int | None = None
+    ) -> None:
+        original_apply(row, session, content_revision=content_revision)
         # Memory has already been staged inside this very transaction.
         assert (
             VariableValue.query.filter_by(user_bid=user, key="goal").one().value

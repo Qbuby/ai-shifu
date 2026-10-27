@@ -13,6 +13,7 @@
     "continueButton": "متابعة",
     "debugSessionExpired": "انتهت جلسة التصحيح هذه أو تغيّر النص. ابدأ التصحيح من جديد.",
     "defaultLearnerName": "المتعلم",
+    "freeTextPlaceholder": "إجابتك",
     "generatedBlockNotFound": "لم يتم العثور على الكتلة المُنشأة",
     "invalidAction": "عملية غير صالحة",
     "lessonFeedbackCommentPlaceholder": "اختياري: أخبرنا باقتراحك",
@@ -20,6 +21,7 @@
     "llmStreamInterrupted": "انقطع الاتصال أثناء الإنشاء، يرجى التحديث ثم المحاولة مرة أخرى",
     "nextChapterButton": "الدرس التالي",
     "outputInProgress": "يجري إخراج المحتوى، يرجى الانتظار حتى ينتهي ثم المحاولة مرة أخرى",
+    "resetLimitReached": "لقد استخدمت جميع مرات إعادة هذا الدرس. يمكنك مواصلة التعلم أو مراجعة المحتوى الحالي أو طرح الأسئلة.",
     "ttsRateLimited": "خدمة الصوت مشغولة حاليًا، يرجى المحاولة مرة أخرى لاحقًا"
   }
 }
